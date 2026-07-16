@@ -1,0 +1,181 @@
+# Build the Grok Build CLI (`xai-grok-pager`) on Linux.
+#
+# Targets the composition-root package only — full-workspace builds are slow
+# and are not recommended for local or CI use (see README.md).
+#
+# Version stamping (`GROK_VERSION`):
+#   - tag push `v0.1.221` / `0.1.221-alpha.4`  → version without leading `v`
+#   - workflow_dispatch input `version`        → that string (optional)
+#   - otherwise                                → package version from
+#     crates/codegen/xai-grok-pager-bin/Cargo.toml
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags:
+      # Accept both v-prefixed and bare semver tags.
+      - "v*"
+      - "[0-9]*"
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "THIRD-PARTY-NOTICES"
+      - "crates/codegen/xai-grok-pager/docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "THIRD-PARTY-NOTICES"
+      - "crates/codegen/xai-grok-pager/docs/**"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: >
+          Product version to stamp into the binary (GROK_VERSION), e.g. 0.1.221
+          or 0.1.221-alpha.4. Leave empty to use the package version from
+          xai-grok-pager-bin/Cargo.toml.
+        required: false
+        type: string
+        default: ""
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Avoid incremental artifacts in CI (smaller cache, cleaner rebuilds).
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: check
+            cargo_args: check -p xai-grok-pager-bin --locked
+          - profile: release
+            cargo_args: build -p xai-grok-pager-bin --release --locked
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve GROK_VERSION
+        id: version
+        run: |
+          set -euo pipefail
+
+          strip_v() {
+            # "v0.1.221" -> "0.1.221"; leave bare semver unchanged
+            local raw="$1"
+            echo "${raw#v}"
+          }
+
+          pkg_version() {
+            # First `version = "..."` under [package] in the binary crate.
+            sed -n 's/^version = "\([^"]*\)"/\1/p' \
+              crates/codegen/xai-grok-pager-bin/Cargo.toml | head -1
+          }
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+            && [ -n "${{ inputs.version }}" ]; then
+            VERSION="$(strip_v '${{ inputs.version }}')"
+            SOURCE="workflow_dispatch"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION="$(strip_v '${{ github.ref_name }}')"
+            SOURCE="git-tag"
+          else
+            VERSION="$(pkg_version)"
+            SOURCE="Cargo.toml"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not resolve GROK_VERSION"
+            exit 1
+          fi
+
+          # Light sanity check (semver-ish; allows pre-release + build metadata)
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::GROK_VERSION='$VERSION' does not look like a semver (e.g. 0.1.221 or 0.1.221-alpha.4)"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
+          # Job-level env for subsequent steps in this job.
+          echo "GROK_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          echo "Resolved GROK_VERSION=$VERSION (source=$SOURCE)"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            protobuf-compiler \
+            libprotobuf-dev \
+            clang \
+            libclang-dev
+          protoc --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Matches rust-toolchain.toml (channel = "1.92.0").
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate caches per matrix profile (check vs release).
+          key: ${{ matrix.profile }}
+          shared-key: grok-build
+          cache-on-failure: true
+
+      - name: Verify toolchain + lockfile MSRV gate
+        run: |
+          rustc -vV
+          cargo -V
+          # Fail early if the lockfile was upgraded past this toolchain
+          # (e.g. aws-config requiring rustc 1.94+).
+          test -f Cargo.lock
+          cargo metadata --format-version 1 --locked >/dev/null
+
+      - name: Cargo ${{ matrix.profile }}
+        # GROK_VERSION is in the environment from "Resolve GROK_VERSION".
+        # find_protoc hard-errors when GITHUB_ACTIONS is set and protoc is
+        # missing; system protobuf-compiler is on PATH from the apt step.
+        run: cargo ${{ matrix.cargo_args }}
+        env:
+          GROK_VERSION: ${{ env.GROK_VERSION }}
+
+      - name: Smoke-test release binary
+        if: matrix.profile == 'release'
+        run: |
+          set -euo pipefail
+          ./target/release/xai-grok-pager --version
+          ./target/release/xai-grok-pager version --json || true
+          file ./target/release/xai-grok-pager
+          ls -lh ./target/release/xai-grok-pager
+          # Ensure the stamped version appears in --version output.
+          ./target/release/xai-grok-pager --version | tee /tmp/ver.txt
+          grep -F "${GROK_VERSION}" /tmp/ver.txt
+        env:
+          GROK_VERSION: ${{ env.GROK_VERSION }}
+
+      - name: Upload release binary
+        if: matrix.profile == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xai-grok-pager-linux-x86_64-${{ env.GROK_VERSION }}
+          path: target/release/xai-grok-pager
+          if-no-files-found: error
+          retention-days: 14
