@@ -74,11 +74,11 @@ rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"
 # env vars below for those platforms.
 # See: https://github.com/tikv/jemallocator/issues/122
 [env]
-# sqlite-vec 0.1.10-alpha.4 enables experimental DiskANN by default, but its
-# crates.io package omits sqlite-vec-diskann.c. Grok memory uses vec0 KNN, not
-# DiskANN, so disable that optional C path until upstream ships a complete crate.
-# `force = false` preserves an explicit caller-provided CFLAGS override.
-CFLAGS = { value = "-DSQLITE_VEC_ENABLE_DISKANN=0", force = false }
+# sqlite-vec 0.1.10-alpha.4 omits the DiskANN, rescore, and experimental IVF
+# implementation files from its crates.io package. Grok memory uses vec0 KNN
+# without these optional paths, so disable all three until upstream ships a
+# complete crate. `force = false` preserves an explicit caller-provided override.
+CFLAGS = { value = "-DSQLITE_VEC_ENABLE_DISKANN=0 -DSQLITE_VEC_ENABLE_RESCORE=0 -DSQLITE_VEC_EXPERIMENTAL_IVF_ENABLE=0", force = false }
 SYSTEM_DEPS_DAV1D_BUILD_INTERNAL = "auto"
 AARCH64_APPLE_DARWIN_JEMALLOC_SYS_WITH_LG_PAGE = "14"
 AARCH64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE = "16"

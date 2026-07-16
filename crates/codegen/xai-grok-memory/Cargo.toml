@@ -25,8 +25,8 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde_json = { workspace = true }
 # sqlite-vec: vec0 virtual table for KNN vector search.
 # 0.1.10-alpha.4 removes non-portable u_int*_t redefinitions for musl support.
-# Its crates.io package omits experimental DiskANN sources, so .cargo/config.toml
-# disables that unused C path with SQLITE_VEC_ENABLE_DISKANN=0.
+# Its crates.io package omits DiskANN, rescore, and experimental IVF sources, so
+# .cargo/config.toml explicitly disables those unused C paths.
 sqlite-vec = "=0.1.10-alpha.4"
 tar = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
