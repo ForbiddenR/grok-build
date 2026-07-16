@@ -3,9 +3,11 @@
 # Targets the composition-root package only — full-workspace builds are slow
 # and are not recommended for local or CI use (see README.md).
 #
-# Job selection (one job per event — no double matrix on tags):
-#   pull_request / push to main  →  check only
-#   tag push / workflow_dispatch →  release only (stamped binary + artifact)
+# Job selection:
+#   pull_request / push to main  →  check only (host gnu)
+#   tag push / workflow_dispatch →  release matrix:
+#       - x86_64-unknown-linux-gnu  (glibc)
+#       - x86_64-unknown-linux-musl (static; matches shipping Linux binaries)
 #
 # Version stamping (`GROK_VERSION`) for the release job:
 #   - tag push `v0.1.221` / `0.1.221-alpha.4`  → version without leading `v`
@@ -53,8 +55,7 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # PR + main: typecheck only (no release binary).
-  # Skipped on tags and manual dispatch so a release tag is a single job.
+  # PR + main: typecheck only (host gnu). Skipped on tags / manual dispatch.
   # ---------------------------------------------------------------------------
   check:
     name: check
@@ -102,13 +103,23 @@ jobs:
         run: cargo check -p xai-grok-pager-bin --locked
 
   # ---------------------------------------------------------------------------
-  # Tag + manual: release build with GROK_VERSION stamp + artifact.
+  # Tag + manual: release builds (gnu + musl) with GROK_VERSION stamp + artifacts.
   # ---------------------------------------------------------------------------
   release:
-    name: release
+    name: release (${{ matrix.artifact_suffix }})
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact_suffix: linux-x86_64-gnu
+            musl: false
+          - target: x86_64-unknown-linux-musl
+            artifact_suffix: linux-x86_64-musl
+            musl: true
 
     steps:
       - name: Checkout
@@ -168,40 +179,68 @@ jobs:
             libprotobuf-dev \
             clang \
             libclang-dev
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends musl-tools
+            musl-gcc --version || true
+          fi
           protoc --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
+          # Matches rust-toolchain.toml (channel = "1.92.0").
           toolchain: "1.92.0"
           components: rustfmt, clippy
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: grok-build-release
+          shared-key: grok-build-release-${{ matrix.target }}
           cache-on-failure: true
 
       - name: Verify toolchain + lockfile MSRV gate
         run: |
           rustc -vV
           cargo -V
+          rustup target list --installed
           test -f Cargo.lock
           cargo metadata --format-version 1 --locked >/dev/null
 
-      - name: Cargo release build
-        run: cargo build -p xai-grok-pager-bin --release --locked
+      - name: Cargo release build (${{ matrix.target }})
+        run: |
+          cargo build \
+            -p xai-grok-pager-bin \
+            --release \
+            --locked \
+            --target "${{ matrix.target }}"
         env:
           GROK_VERSION: ${{ env.GROK_VERSION }}
+          # musl-tools provides musl-gcc as the C/C++ linker for the musl target.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
 
       - name: Smoke-test release binary
         run: |
           set -euo pipefail
-          ./target/release/xai-grok-pager --version
-          ./target/release/xai-grok-pager version --json || true
-          file ./target/release/xai-grok-pager
-          ls -lh ./target/release/xai-grok-pager
-          ./target/release/xai-grok-pager --version | tee /tmp/ver.txt
+          BIN="target/${{ matrix.target }}/release/xai-grok-pager"
+          test -x "$BIN"
+          file "$BIN"
+          ls -lh "$BIN"
+          # Static musl binaries should not need glibc; gnu is host-native.
+          if [ "${{ matrix.musl }}" = "true" ]; then
+            # Prefer fully static linkage for portable Linux distro coverage.
+            if command -v ldd >/dev/null; then
+              if ldd "$BIN" >/tmp/ldd.out 2>&1; then
+                echo "::warning::musl binary is not fully static; ldd output:"
+                cat /tmp/ldd.out
+              else
+                echo "ldd reports static (or non-dynamic) binary — good"
+                cat /tmp/ldd.out || true
+              fi
+            fi
+          fi
+          "$BIN" --version | tee /tmp/ver.txt
+          "$BIN" version --json || true
           grep -F "${GROK_VERSION}" /tmp/ver.txt
         env:
           GROK_VERSION: ${{ env.GROK_VERSION }}
@@ -209,7 +248,7 @@ jobs:
       - name: Upload release binary
         uses: actions/upload-artifact@v4
         with:
-          name: xai-grok-pager-linux-x86_64-${{ env.GROK_VERSION }}
-          path: target/release/xai-grok-pager
+          name: xai-grok-pager-${{ matrix.artifact_suffix }}-${{ env.GROK_VERSION }}
+          path: target/${{ matrix.target }}/release/xai-grok-pager
           if-no-files-found: error
           retention-days: 14
