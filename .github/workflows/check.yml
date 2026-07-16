@@ -1,0 +1,74 @@
+# PR + main branch validation for the Grok Build CLI composition root.
+#
+# Full-workspace builds are slow and are not recommended for local or CI use
+# (see README.md). This workflow only typechecks `xai-grok-pager-bin`.
+
+name: Check
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "THIRD-PARTY-NOTICES"
+      - "crates/codegen/xai-grok-pager/docs/**"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - "THIRD-PARTY-NOTICES"
+      - "crates/codegen/xai-grok-pager/docs/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Avoid incremental artifacts in CI (smaller cache, cleaner rebuilds).
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            protobuf-compiler \
+            libprotobuf-dev \
+            clang \
+            libclang-dev
+          protoc --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Matches rust-toolchain.toml (channel = "1.92.0").
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: grok-build-check
+          cache-on-failure: true
+
+      - name: Verify toolchain + lockfile MSRV gate
+        run: |
+          rustc -vV
+          cargo -V
+          test -f Cargo.lock
+          cargo metadata --format-version 1 --locked >/dev/null
+
+      - name: Cargo check
+        run: cargo check -p xai-grok-pager-bin --locked

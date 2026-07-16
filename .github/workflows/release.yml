@@ -1,0 +1,160 @@
+# Release builds for the Grok Build CLI on Linux.
+#
+# Trigger: GitHub Release published → build matrix → attach tar.gz + sha256.
+#
+# Flow:
+#   1. Publish a GitHub Release for a semver tag (draft optional first).
+#   2. This workflow builds gnu + musl, packs `grok`, uploads assets.
+#
+# Assets per target:
+#   grok-<target>.tar.gz      (contains top-level binary `grok`)
+#   grok-<target>.sha256
+
+name: Release
+
+on:
+  release:
+    types:
+      - published
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  release-cross:
+    name: release (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Resolve GROK_VERSION
+        id: version
+        run: |
+          set -euo pipefail
+          raw='${{ github.event.release.tag_name }}'
+          VERSION="${raw#v}"
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$raw' is not semver (e.g. v0.1.221 or 0.1.221-alpha.4)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "GROK_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Resolved GROK_VERSION=$VERSION"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            protobuf-compiler \
+            libprotobuf-dev \
+            clang \
+            libclang-dev
+          case "${{ matrix.target }}" in
+            *musl*)
+              sudo apt-get install -y --no-install-recommends musl-tools
+              musl-gcc --version || true
+              ;;
+          esac
+          protoc --version
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          # Matches rust-toolchain.toml (channel = "1.92.0").
+          toolchain: "1.92.0"
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: grok-build-release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Compile
+        run: |
+          cargo build \
+            -p xai-grok-pager-bin \
+            --release \
+            --locked \
+            --target "${{ matrix.target }}"
+        env:
+          GROK_VERSION: ${{ env.GROK_VERSION }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
+      - name: Pack unix binary
+        id: pack
+        run: |
+          set -euo pipefail
+          SRC="target/${{ matrix.target }}/release/xai-grok-pager"
+          test -x "$SRC"
+
+          STAGE="release-${{ matrix.target }}"
+          mkdir -p "$STAGE/bin"
+          # Official install name is `grok` (Cargo artifact stays xai-grok-pager).
+          cp -a "$SRC" "$STAGE/bin/grok"
+          chmod +x "$STAGE/bin/grok"
+
+          ARCHIVE="grok-${{ matrix.target }}.tar.gz"
+          tar -C "$STAGE/bin" -zcf "${STAGE}/${ARCHIVE}" grok
+
+          # Smoke-test staged binary + archive contents.
+          "$STAGE/bin/grok" --version | tee /tmp/ver.txt
+          grep -F "${GROK_VERSION}" /tmp/ver.txt
+          tar -tzf "${STAGE}/${ARCHIVE}" | grep -qx 'grok'
+
+          case "${{ matrix.target }}" in
+            *musl*)
+              if command -v ldd >/dev/null; then
+                if ldd "$STAGE/bin/grok" >/tmp/ldd.out 2>&1; then
+                  echo "::warning::musl binary is not fully static; ldd output:"
+                  cat /tmp/ldd.out
+                else
+                  echo "ldd reports static (or non-dynamic) binary — good"
+                  cat /tmp/ldd.out || true
+                fi
+              fi
+              ;;
+          esac
+
+          echo "dir=${STAGE}" >> "$GITHUB_OUTPUT"
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          ls -lh "${STAGE}/${ARCHIVE}"
+        env:
+          GROK_VERSION: ${{ env.GROK_VERSION }}
+
+      - name: Add signature
+        run: |
+          set -euo pipefail
+          cd "${{ steps.pack.outputs.dir }}"
+          sha256sum "${{ steps.pack.outputs.archive }}" \
+            | tee "grok-${{ matrix.target }}.sha256"
+          cat "grok-${{ matrix.target }}.sha256"
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          fail_on_unmatched_files: true
+          files: |
+            release-${{ matrix.target }}/grok-${{ matrix.target }}.tar.gz
+            release-${{ matrix.target }}/grok-${{ matrix.target }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
