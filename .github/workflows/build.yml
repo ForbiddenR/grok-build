@@ -3,7 +3,11 @@
 # Targets the composition-root package only — full-workspace builds are slow
 # and are not recommended for local or CI use (see README.md).
 #
-# Version stamping (`GROK_VERSION`):
+# Job selection (one job per event — no double matrix on tags):
+#   pull_request / push to main  →  check only
+#   tag push / workflow_dispatch →  release only (stamped binary + artifact)
+#
+# Version stamping (`GROK_VERSION`) for the release job:
 #   - tag push `v0.1.221` / `0.1.221-alpha.4`  → version without leading `v`
 #   - workflow_dispatch input `version`        → that string (optional)
 #   - otherwise                                → package version from
@@ -48,18 +52,63 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  build:
-    name: build (${{ matrix.profile }})
+  # ---------------------------------------------------------------------------
+  # PR + main: typecheck only (no release binary).
+  # Skipped on tags and manual dispatch so a release tag is a single job.
+  # ---------------------------------------------------------------------------
+  check:
+    name: check
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch')
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - profile: check
-            cargo_args: check -p xai-grok-pager-bin --locked
-          - profile: release
-            cargo_args: build -p xai-grok-pager-bin --release --locked
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            pkg-config \
+            protobuf-compiler \
+            libprotobuf-dev \
+            clang \
+            libclang-dev
+          protoc --version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: grok-build-check
+          cache-on-failure: true
+
+      - name: Verify toolchain + lockfile MSRV gate
+        run: |
+          rustc -vV
+          cargo -V
+          test -f Cargo.lock
+          cargo metadata --format-version 1 --locked >/dev/null
+
+      - name: Cargo check
+        run: cargo check -p xai-grok-pager-bin --locked
+
+  # ---------------------------------------------------------------------------
+  # Tag + manual: release build with GROK_VERSION stamp + artifact.
+  # ---------------------------------------------------------------------------
+  release:
+    name: release
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -77,7 +126,6 @@ jobs:
           }
 
           pkg_version() {
-            # First `version = "..."` under [package] in the binary crate.
             sed -n 's/^version = "\([^"]*\)"/\1/p' \
               crates/codegen/xai-grok-pager-bin/Cargo.toml | head -1
           }
@@ -99,7 +147,6 @@ jobs:
             exit 1
           fi
 
-          # Light sanity check (semver-ish; allows pre-release + build metadata)
           if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
             echo "::error::GROK_VERSION='$VERSION' does not look like a semver (e.g. 0.1.221 or 0.1.221-alpha.4)"
             exit 1
@@ -107,9 +154,7 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "source=$SOURCE" >> "$GITHUB_OUTPUT"
-          # Job-level env for subsequent steps in this job.
           echo "GROK_VERSION=$VERSION" >> "$GITHUB_ENV"
-
           echo "Resolved GROK_VERSION=$VERSION (source=$SOURCE)"
 
       - name: Install system dependencies
@@ -128,51 +173,40 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          # Matches rust-toolchain.toml (channel = "1.92.0").
           toolchain: "1.92.0"
           components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          # Separate caches per matrix profile (check vs release).
-          key: ${{ matrix.profile }}
-          shared-key: grok-build
+          shared-key: grok-build-release
           cache-on-failure: true
 
       - name: Verify toolchain + lockfile MSRV gate
         run: |
           rustc -vV
           cargo -V
-          # Fail early if the lockfile was upgraded past this toolchain
-          # (e.g. aws-config requiring rustc 1.94+).
           test -f Cargo.lock
           cargo metadata --format-version 1 --locked >/dev/null
 
-      - name: Cargo ${{ matrix.profile }}
-        # GROK_VERSION is in the environment from "Resolve GROK_VERSION".
-        # find_protoc hard-errors when GITHUB_ACTIONS is set and protoc is
-        # missing; system protobuf-compiler is on PATH from the apt step.
-        run: cargo ${{ matrix.cargo_args }}
+      - name: Cargo release build
+        run: cargo build -p xai-grok-pager-bin --release --locked
         env:
           GROK_VERSION: ${{ env.GROK_VERSION }}
 
       - name: Smoke-test release binary
-        if: matrix.profile == 'release'
         run: |
           set -euo pipefail
           ./target/release/xai-grok-pager --version
           ./target/release/xai-grok-pager version --json || true
           file ./target/release/xai-grok-pager
           ls -lh ./target/release/xai-grok-pager
-          # Ensure the stamped version appears in --version output.
           ./target/release/xai-grok-pager --version | tee /tmp/ver.txt
           grep -F "${GROK_VERSION}" /tmp/ver.txt
         env:
           GROK_VERSION: ${{ env.GROK_VERSION }}
 
       - name: Upload release binary
-        if: matrix.profile == 'release'
         uses: actions/upload-artifact@v4
         with:
           name: xai-grok-pager-linux-x86_64-${{ env.GROK_VERSION }}
