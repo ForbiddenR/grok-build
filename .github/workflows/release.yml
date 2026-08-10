@@ -78,8 +78,8 @@ jobs:
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          # Matches rust-toolchain.toml (channel = "1.92.0").
-          toolchain: "1.92.0"
+          # Matches rust-toolchain.toml (channel = "1.94.0").
+          toolchain: "1.94.0"
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
